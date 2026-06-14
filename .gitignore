@@ -1,39 +1,31 @@
-# CMake / Qt builds
-/build/
-/build-*/
+# CMake
+build/
 cmake-build-*/
-CMakeCache.txt
 CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 CTestTestfile.cmake
 Makefile
 *.cmake.user
 
 # Qt Creator
 *.pro.user*
-*.autosave
+*.qtc.user*
 
-# Visual Studio
-.vs/
-*.sln
-*.vcxproj*
-
-# Binaries and libraries
-*.exe
-*.dll
-*.lib
+# Compilers and binaries
+*.o
 *.obj
-*.pdb
-*.ilk
 *.a
+*.lib
+*.dll
 *.so
 *.dylib
+*.exe
+*.pdb
+*.ilk
 
-# Runtime output
-*.log
-*.pcap
-*.pcapng
-
-# Operating systems
+# Editors and OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-desktop.ini

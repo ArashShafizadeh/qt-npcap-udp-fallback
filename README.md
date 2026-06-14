@@ -1,133 +1,176 @@
-# Qt Npcap UDP Fallback
+# Qt UDP Frame Reassembler
 
-[![Qt 6](https://img.shields.io/badge/Qt-6-41CD52?logo=qt&logoColor=white)](https://www.qt.io/)
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://isocpp.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](#requirements)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+![Qt UDP Frame Reassembler social preview](docs/assets/social-preview.png)
 
-A Qt 6 and C++ UDP packet receiver for Windows that combines `QUdpSocket` with an Npcap raw Ethernet capture fallback.
+A reusable Qt 5/6 and C++17 component for reconstructing application-level messages that have been split across multiple UDP datagrams.
 
-It is designed for cases where Windows drops valid UDP frames before they reach `QUdpSocket`, for example because of an incorrect or stale destination MAC address. Npcap captures the raw Ethernet frame in parallel and delivers the UDP payload to the application even when the normal Windows socket path rejects it.
+It supports out-of-order delivery, interleaved batches, duplicate suppression, timeout cleanup, missing-batch detection, CRC32 validation, and unsigned 8-bit batch wrap-around. The repository also includes a Qt Widgets simulator that sends real UDP traffic over localhost so each edge case can be reproduced with one click.
 
-> This repository is a generic reference implementation. It contains no hardware-specific protocol, production addresses, calibration data, packet IDs, or private application logic.
+> This public project uses a generic demonstration packet format. It contains no private FPGA protocol, production address, packet identifier, calibration value, or company-specific logic.
 
-## Interface preview
+## What problem does it solve?
 
-![Illustrative Qt Npcap UDP Fallback interface showing receiver configuration, live packet counters, a UDP smoke test, and packet logs](docs/screenshots/main-window-preview.png)
+Large FPGA, embedded, telemetry, and data-acquisition payloads are often split into smaller application packets before being sent over UDP. UDP delivers individual datagrams, but it does not rebuild the original application-level message.
 
-> The image above is an illustrative preview generated from the current Qt Widgets layout. Replace it with a real Windows runtime screenshot after the first verified Npcap build.
+Packets may arrive:
 
-## What it demonstrates
+- in the wrong order
+- mixed with fragments from another batch
+- more than once
+- after a long delay
+- or not at all
 
-- Normal UDP reception through `QUdpSocket`
-- Runtime loading of `wpcap.dll` with no Npcap SDK build dependency
-- Automatic adapter discovery using the selected local IPv4 address
-- BPF filtering by destination IPv4 address and UDP port range
-- Ethernet, stacked VLAN/QinQ, raw IPv4, and `DLT_NULL` parsing
-- Cross-path duplicate suppression when Qt and Npcap receive the same datagram
-- Graceful standard-UDP-only operation when Npcap is unavailable
-- A Qt Widgets dashboard with packet counters and a live packet log
-- Unit tests for the raw IPv4/UDP parser
+`FrameReassembler` keeps independent assemblies for every stream and batch, validates each fragment, restores payload order, verifies the completed message, and emits only forward-moving completed batches.
 
-## Use cases
+## Key features
 
-- FPGA and embedded-device data acquisition
-- Industrial Ethernet monitoring
-- UDP troubleshooting on Windows
-- Recovering frames rejected before `QUdpSocket`
-- Qt-based packet capture and diagnostic applications
-- Laboratory instruments and high-rate telemetry receivers
+### Reassembly and ordering
+
+- Out-of-order UDP fragment reassembly
+- Multiple interleaved batches without cross-contamination
+- Independent stream IDs
+- Correct unsigned 8-bit wrap-around (`254 → 255 → 0 → 1`)
+- Missing batch detection
+- Late or old completed-batch suppression
+
+### Validation and reliability
+
+- Identical duplicate-fragment suppression
+- Conflicting duplicate and metadata detection
+- Final message-length validation
+- CRC32 integrity validation
+- Per-assembly timeout cleanup
+- Configurable active-assembly and message-size limits
+
+### Qt integration
+
+- Qt signals for completed messages, missing batches, events, and statistics
+- Qt Widgets UDP simulator and monitoring dashboard
+- Real localhost traffic through `QUdpSocket`
+- Qt Test coverage for core edge cases
+- Qt 5 and Qt 6 compatibility
+
+## Demo scenarios
+
+The included application can reproduce these cases through a real localhost UDP path:
+
+1. Ordered fragments
+2. Reversed or out-of-order fragments
+3. An identical duplicate fragment
+4. Two interleaved batches
+5. A skipped batch ID
+6. An incomplete batch that expires
+
+This makes the project useful both as a reusable component and as a visual diagnostic tool for packet-ordering problems.
 
 ## Architecture
 
 ```text
-                           +-----------------------+
-Device --> Ethernet/NIC -->| Windows network stack |--> QUdpSocket ----+
-          |                +-----------------------+                   |
-          |                                                            v
-          +--> Npcap promiscuous capture --> frame parser --> deduplicator --> application
+UDP datagram
+    │
+    ▼
+PacketFormat::parse
+    │  validates header, indexes, lengths and limits
+    ▼
+FrameReassembler
+    ├── assembly[stream, batch]
+    ├── duplicate/conflict detection
+    ├── timeout and capacity cleanup
+    ├── concatenate by fragment index
+    ├── total-length + CRC32 validation
+    └── per-stream batch-order guard
+             │
+             ▼
+       messageReady(...)
 ```
 
-Npcap runs in parallel rather than waiting for a socket failure. This matters because a frame rejected at Ethernet layer 2 may never produce an error that the application can detect through `QUdpSocket`.
+## Minimal integration
 
-## Requirements
+```cpp
+#include "reassembly/framereassembler.h"
 
-- Qt 6.4 or newer with the Widgets and Network modules
+qfr::FrameReassembler reassembler;
+
+connect(&reassembler,
+        &qfr::FrameReassembler::messageReady,
+        this,
+        [](quint8 streamId, quint8 batchId, const QByteArray &message) {
+            // Consume the fully reconstructed message.
+        });
+
+// Call this for every UDP datagram received by QUdpSocket.
+reassembler.feedDatagram(datagram);
+```
+
+Use a periodic timer to remove incomplete messages promptly:
+
+```cpp
+connect(cleanupTimer, &QTimer::timeout, &reassembler, [&reassembler]() {
+    reassembler.purgeExpired();
+});
+```
+
+## Generic packet format
+
+The demonstration protocol uses a 20-byte header containing:
+
+- protocol magic and version
+- stream ID and 8-bit batch ID
+- fragment count and zero-based fragment index
+- fragment payload length
+- complete-message length
+- complete-message CRC32
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the exact byte layout.
+
+## Reassembly policy
+
+The first completed batch for a stream becomes its synchronization point. Newer completed batches are delivered in unsigned 8-bit sequence order. Missing batch IDs are reported, while late completed batches are dropped so downstream displays and processors do not move backward.
+
+This behavior is especially useful in live acquisition systems where the newest complete frame matters more than waiting indefinitely for an older incomplete frame.
+
+## Limits and safety
+
+The defaults are intentionally bounded:
+
+- 2-second incomplete-assembly timeout
+- 64 active assemblies
+- 4 MiB maximum reconstructed message
+- 255 fragments per message, imposed by the demonstration header
+
+All limits are configurable through `FrameReassembler::Limits`.
+
+## Build and test
+
+### Requirements
+
 - CMake 3.21 or newer
-- A C++17 compiler
-- Windows for the Npcap raw-frame path
-- Npcap installed on the target machine; Wireshark installations commonly include it
-
-The project also builds on Linux and macOS, but it operates in `QUdpSocket`-only mode on those platforms.
-
-## Build with Qt Creator
-
-1. Open `CMakeLists.txt` in Qt Creator.
-2. Select a Qt 6 desktop kit.
-3. Configure and build the project.
-4. Run `qt-npcap-udp-fallback`.
-5. On Windows, confirm that Npcap is installed before testing raw-frame reception.
-
-## Build from a terminal
+- A C++17-compatible compiler
+- Qt 6 or Qt 5 with Core, Network, Widgets, and Test modules
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-On Windows, run the produced executable from the Release output directory. Npcap must be installed on the target computer because `wpcap.dll` is loaded at runtime.
+Run the demo:
 
-## Usage
+```bash
+./build/frame_reassembler_demo
+```
 
-1. Select the local IPv4 address of the adapter connected to the sender. `0.0.0.0` scans all non-loopback IPv4 adapters.
-2. Enter a destination UDP port or a port range.
-3. Keep **Enable Npcap raw-frame fallback** selected.
-4. Start the receiver.
-5. Use **Send to first port** for a basic `QUdpSocket` smoke test.
-6. Connect the real device to test the raw-frame fallback path.
+On a multi-config Windows generator, the executable is normally located under `build/Release/`.
 
-## How the fallback helps
+## Use cases
 
-A normal UDP application only sees packets accepted by the operating system network stack. When the destination MAC address is stale or incorrect, Windows may discard the Ethernet frame before IP and UDP processing. Npcap can capture the raw frame from the network adapter, after which this project parses the IPv4 and UDP headers and forwards the payload through the same application-level callback used by `QUdpSocket`.
-
-## Important limitations
-
-- The parser currently accepts IPv4/UDP only.
-- Fragmented IPv4 datagrams are intentionally rejected.
-- Npcap can expose rejected frames only when the network adapter and driver provide them in promiscuous mode.
-- Some systems require elevated privileges or an Npcap installation configured for non-admin capture.
-- The demo opens one `QUdpSocket` per port and limits a configured range to 256 ports.
-- The duplicate window is intentionally short and suppresses only packets seen through both receive paths.
-
-## Troubleshooting
-
-### Npcap is not detected
-
-Install Npcap and confirm that `wpcap.dll` is available on the machine. Restart the application after installation.
-
-### Standard UDP works but raw capture does not
-
-Check the selected network adapter, run the application with sufficient privileges, and verify that the adapter supports promiscuous capture.
-
-### The same packet appears twice
-
-The receiver includes cross-path duplicate suppression. If duplicates remain, capture logs from both paths and review the configured duplicate window.
-
-## Why `wpcap.dll` is not included
-
-Npcap has separate distribution and licensing terms. This repository dynamically loads an existing local Npcap installation and does not redistribute Npcap binaries.
-
-## Release
-
-The first public release is documented in [`RELEASE_NOTES_v1.0.0.md`](RELEASE_NOTES_v1.0.0.md).
-
-## Repository topics
-
-Suggested GitHub topics:
-
-`qt` `qt6` `cpp` `udp` `npcap` `pcap` `qudpsocket` `packet-capture` `networking` `ethernet` `windows` `cmake` `ipv4` `vlan` `data-acquisition`
+- FPGA and embedded-device data acquisition
+- Industrial UDP telemetry
+- Real-time sensor frames
+- Qt networking applications
+- Packet-loss and ordering diagnostics
+- Custom application protocols built on UDP
 
 ## License
 
-The source code in this repository is available under the [MIT License](LICENSE). Npcap itself is a separate third-party product and is not covered by this repository's license.
+MIT License. See [LICENSE](LICENSE).
